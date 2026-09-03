@@ -1,0 +1,288 @@
+diff --git a/src/allocator.cpp b/src/allocator.cpp
+index f885453..18aaaa7 100644
+--- a/src/allocator.cpp
++++ b/src/allocator.cpp
+@@ -692,6 +692,29 @@ void VkBlobAllocator::clear()
+     d->image_memory_budgets.clear();
+ }
+ 
++void VkBlobAllocator::trim()
++{
++    for (size_t i = d->buffer_blocks.size(); i > 0; i--)
++    {
++        const size_t index = i - 1;
++        const std::list<std::pair<size_t, size_t> >& budget =
++            d->buffer_budgets[index];
++        VkBufferMemory* ptr = d->buffer_blocks[index];
++        if (budget.size() != 1 || budget.front().first != 0 ||
++            budget.front().second != ptr->capacity)
++            continue;
++
++        if (mappable)
++            vkUnmapMemory(vkdev->vkdevice(), ptr->memory);
++        vkDestroyBuffer(vkdev->vkdevice(), ptr->buffer, 0);
++        vkFreeMemory(vkdev->vkdevice(), ptr->memory, 0);
++        delete ptr;
++
++        d->buffer_blocks.erase(d->buffer_blocks.begin() + index);
++        d->buffer_budgets.erase(d->buffer_budgets.begin() + index);
++    }
++}
++
+ VkBufferMemory* VkBlobAllocator::fastMalloc(size_t size)
+ {
+     size_t aligned_size = alignSize(size, d->buffer_offset_alignment);
+@@ -799,6 +822,7 @@ VkBufferMemory* VkBlobAllocator::fastMalloc(size_t size)
+     }
+ 
+     block->memory_type_index = buffer_memory_type_index;
++    block->capacity = new_block_size;
+ 
+     d->buffer_blocks.push_back(block);
+ 
+diff --git a/src/allocator.h b/src/allocator.h
+index 14ff4d5..e854528 100644
+--- a/src/allocator.h
++++ b/src/allocator.h
+@@ -309,6 +309,10 @@ public:
+     // release all budgets immediately
+     virtual void clear();
+ 
++    // release completely unused buffer blocks
++    // The caller must ensure that all commands using freed blocks completed.
++    void trim();
++
+     virtual VkBufferMemory* fastMalloc(size_t size);
+     virtual void fastFree(VkBufferMemory* ptr);
+     virtual VkImageMemory* fastMalloc(int w, int h, int c, size_t elemsize, int elempack);
+diff --git a/src/layer/vulkan/gemm_vulkan.cpp b/src/layer/vulkan/gemm_vulkan.cpp
+index b2e57c2..d829023 100644
+--- a/src/layer/vulkan/gemm_vulkan.cpp
++++ b/src/layer/vulkan/gemm_vulkan.cpp
+@@ -825,60 +825,110 @@ int Gemm_vulkan::forward(const std::vector<VkMat>& bottom_blobs, std::vector<VkM
+     if (top_blob.empty())
+         return -100;
+ 
+-    if (use_cooperative_matrix)
++    int max_dispatch_M = M;
++#if NCNN_BATCH
++    // Some Vulkan drivers produce invalid results when a single storage-buffer
++    // descriptor range crosses the signed 32-bit boundary. Split dynamic 2D
++    // row-major Gemm along M so every dispatch binds bounded A/output views.
++    // M-dependent C broadcasts need their own sliced view and are deliberately
++    // excluded until that path is implemented.
++    const size_t max_signed_descriptor_range = 0x7fffffffu;
++    const bool can_split_M = !constantA && !constantM && !transA && !output_transpose
++                             && A.dims == 2 && top_blob.dims == 2
++                             && A.n == 1 && top_blob.n == 1
++                             && (broadcast_type_C == -1 || broadcast_type_C == 0 || broadcast_type_C == 4)
++                             && M % A_elempack == 0 && M % out_elempack == 0;
++    if (can_split_M
++        && (A.buffer_capacity() > max_signed_descriptor_range || top_blob.buffer_capacity() > max_signed_descriptor_range))
+     {
+-        std::vector<VkMat> bindings(5);
+-        bindings[0] = top_blob;
+-        bindings[1] = A;
+-        bindings[2] = B;
+-        bindings[3] = C;
+-        bindings[4] = top_blob;
++        const int m_alignment = std::max(A_elempack, out_elempack);
++        max_dispatch_M = 16384 / m_alignment * m_alignment;
++    }
++#endif
+ 
+-        std::vector<vk_constant_type> constants(13);
+-        constants[0].i = M;
+-        constants[1].i = N;
+-        constants[2].i = K;
+-        constants[3].i = broadcast_type_C;
+-        constants[4].i = A.dims;
+-        constants[5].i = A.dims == 3 ? A.cstep : A.dims == 2 ? A.w : transA ? M : K;
+-        constants[6].i = B.dims;
+-        constants[7].i = B.dims == 3 ? B.cstep : B.dims == 2 ? B.w : transB ? K : N;
+-        constants[8].i = top_blob.dims;
+-        constants[9].i = top_blob.dims == 3 ? top_blob.cstep : top_blob.w;
+-        constants[10].i = A_elempack;
+-        constants[11].i = B_elempack;
+-        constants[12].i = out_elempack;
++    for (int m_offset = 0; m_offset < M; m_offset += max_dispatch_M)
++    {
++        const int dispatch_M = std::min(max_dispatch_M, M - m_offset);
+ 
+-        const int blocks_x = (M + coopmat_M * UNROLL_SG_M * UNROLL_WG_M - 1) / (coopmat_M * UNROLL_SG_M * UNROLL_WG_M);
+-        const int blocks_y = (N + coopmat_N * UNROLL_SG_N * UNROLL_WG_N - 1) / (coopmat_N * UNROLL_SG_N * UNROLL_WG_N);
++        VkMat A_dispatch = A;
++        VkMat top_blob_dispatch = top_blob;
++#if NCNN_BATCH
++        if (max_dispatch_M != M)
++        {
++            const int A_row_offset = m_offset / A_elempack;
++            A_dispatch.h = dispatch_M / A_elempack;
++            A_dispatch.cstep = alignSize((size_t)A_dispatch.w * A_dispatch.h * A_dispatch.elemsize, 16) / A_dispatch.elemsize;
++            A_dispatch.nstep = A_dispatch.total();
++            A_dispatch.offset = A.offset + (size_t)A_row_offset * A.w * A.elemsize;
++
++            const int top_row_offset = m_offset / out_elempack;
++            top_blob_dispatch.h = dispatch_M / out_elempack;
++            top_blob_dispatch.cstep = alignSize((size_t)top_blob_dispatch.w * top_blob_dispatch.h * top_blob_dispatch.elemsize, 16) / top_blob_dispatch.elemsize;
++            top_blob_dispatch.nstep = top_blob_dispatch.total();
++            top_blob_dispatch.offset = top_blob.offset + (size_t)top_row_offset * top_blob.w * top_blob.elemsize;
++        }
++#endif
+ 
+-        VkMat dispatcher;
+-        dispatcher.w = (blocks_x * blocks_y) * (coopmat_subgroup_size * UNROLL_WG_M * UNROLL_WG_N);
+-        dispatcher.h = 1;
+-        dispatcher.c = 1;
++        if (use_cooperative_matrix)
++        {
++            std::vector<VkMat> bindings(5);
++            bindings[0] = top_blob_dispatch;
++            bindings[1] = A_dispatch;
++            bindings[2] = B;
++            bindings[3] = C;
++            bindings[4] = top_blob_dispatch;
++
++            std::vector<vk_constant_type> constants(13);
++            constants[0].i = dispatch_M;
++            constants[1].i = N;
++            constants[2].i = K;
++            constants[3].i = broadcast_type_C;
++            constants[4].i = A_dispatch.dims;
++            constants[5].i = A_dispatch.dims == 3 ? A_dispatch.cstep : A_dispatch.dims == 2 ? A_dispatch.w
++                                                                                           : transA ? dispatch_M
++                                                                                                    : K;
++            constants[6].i = B.dims;
++            constants[7].i = B.dims == 3 ? B.cstep : B.dims == 2 ? B.w
++                                                                       : transB ? K
++                                                                                : N;
++            constants[8].i = top_blob_dispatch.dims;
++            constants[9].i = top_blob_dispatch.dims == 3 ? top_blob_dispatch.cstep : top_blob_dispatch.w;
++            constants[10].i = A_elempack;
++            constants[11].i = B_elempack;
++            constants[12].i = out_elempack;
++
++            const int blocks_x = (dispatch_M + coopmat_M * UNROLL_SG_M * UNROLL_WG_M - 1) / (coopmat_M * UNROLL_SG_M * UNROLL_WG_M);
++            const int blocks_y = (N + coopmat_N * UNROLL_SG_N * UNROLL_WG_N - 1) / (coopmat_N * UNROLL_SG_N * UNROLL_WG_N);
++
++            VkMat dispatcher;
++            dispatcher.w = (blocks_x * blocks_y) * (coopmat_subgroup_size * UNROLL_WG_M * UNROLL_WG_N);
++            dispatcher.h = 1;
++            dispatcher.c = 1;
++
++            cmd.record_pipeline(pipeline_gemm, bindings, constants, dispatcher);
++            continue;
++        }
+ 
+-        cmd.record_pipeline(pipeline_gemm, bindings, constants, dispatcher);
+-    }
+-    else
+-    {
+         std::vector<VkMat> bindings(5);
+-        bindings[0] = top_blob;
+-        bindings[1] = A;
++        bindings[0] = top_blob_dispatch;
++        bindings[1] = A_dispatch;
+         bindings[2] = B;
+         bindings[3] = C;
+-        bindings[4] = top_blob;
++        bindings[4] = top_blob_dispatch;
+ 
+         std::vector<vk_constant_type> constants(13);
+-        constants[0].i = M;
++        constants[0].i = dispatch_M;
+         constants[1].i = N;
+         constants[2].i = K;
+         constants[3].i = broadcast_type_C;
+-        constants[4].i = A.dims;
+-        constants[5].i = A.dims == 3 ? A.cstep : A.dims == 2 ? A.w : transA ? M : K;
++        constants[4].i = A_dispatch.dims;
++        constants[5].i = A_dispatch.dims == 3 ? A_dispatch.cstep : A_dispatch.dims == 2 ? A_dispatch.w
++                                                                                       : transA ? dispatch_M
++                                                                                                : K;
+         constants[6].i = B.dims;
+         constants[7].i = B.dims == 3 ? B.cstep : B.dims == 2 ? B.w : transB ? K : N;
+-        constants[8].i = top_blob.dims;
+-        constants[9].i = top_blob.dims == 3 ? top_blob.cstep : top_blob.w;
++        constants[8].i = top_blob_dispatch.dims;
++        constants[9].i = top_blob_dispatch.dims == 3 ? top_blob_dispatch.cstep : top_blob_dispatch.w;
+         constants[10].i = out_elempack;
+         constants[11].i = A_elempack;
+         constants[12].i = B_elempack;
+@@ -887,19 +937,19 @@ int Gemm_vulkan::forward(const std::vector<VkMat>& bottom_blobs, std::vector<VkM
+         {
+             VkMat dispatcher;
+             dispatcher.w = (N + 3) / 4;
+-            dispatcher.h = (M + 3) / 4;
++            dispatcher.h = (dispatch_M + 3) / 4;
+             dispatcher.c = 1;
+             cmd.record_pipeline(pipeline_gemm, bindings, constants, dispatcher);
+         }
+         else if (use_subgroup_ops)
+         {
+             bindings.resize(7);
+-            bindings[5] = A;
++            bindings[5] = A_dispatch;
+             bindings[6] = B;
+ 
+             const int subgroup_size = vkdev->info.subgroup_size();
+ 
+-            const int blocks_x = (M + (UNROLL_SG_M * 4 - 1)) / (UNROLL_SG_M * 4);
++            const int blocks_x = (dispatch_M + (UNROLL_SG_M * 4 - 1)) / (UNROLL_SG_M * 4);
+             const int blocks_y = (N + (UNROLL_SG_N * 4 - 1)) / (UNROLL_SG_N * 4);
+ 
+             VkMat dispatcher;
+@@ -912,7 +962,7 @@ int Gemm_vulkan::forward(const std::vector<VkMat>& bottom_blobs, std::vector<VkM
+         {
+             VkMat dispatcher;
+             dispatcher.w = (N + 3) / 4;
+-            dispatcher.h = (M + 3) / 4;
++            dispatcher.h = (dispatch_M + 3) / 4;
+             dispatcher.c = 1;
+             cmd.record_pipeline(pipeline_gemm, bindings, constants, dispatcher);
+         }
+diff --git a/src/layer/vulkan/reduction_vulkan.cpp b/src/layer/vulkan/reduction_vulkan.cpp
+index 8607df0..dfa9628 100644
+--- a/src/layer/vulkan/reduction_vulkan.cpp
++++ b/src/layer/vulkan/reduction_vulkan.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "reduction_vulkan.h"
+ 
++#include <algorithm>
+ #include <vector>
+ 
+ #include "layer_shader_type.h"
+@@ -190,8 +191,10 @@ int Reduction_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompu
+ 
+     VkMat dispatcher;
+     dispatcher.w = 256;
+-    dispatcher.h = out_total;
+-    dispatcher.c = 1;
++    // Vulkan guarantees at least 65535 workgroups for Y/Z. Flatten the
++    // logical output over Y/Z so large row-wise reductions remain valid.
++    dispatcher.h = std::min(out_total, 65535);
++    dispatcher.c = (out_total + dispatcher.h - 1) / dispatcher.h;
+ 
+     cmd.record_pipeline(pipeline_reduction, bindings, constants, dispatcher);
+     return 0;
+diff --git a/src/layer/vulkan/shader/reduction.comp b/src/layer/vulkan/shader/reduction.comp
+index 61e5bf2..d7c9e21 100644
+--- a/src/layer/vulkan/shader/reduction.comp
++++ b/src/layer/vulkan/shader/reduction.comp
+@@ -154,9 +154,14 @@ afp finalize_out(afp outv)
+ 
+ void main()
+ {
+-    const int out_index = int(gl_WorkGroupID.y);
++    const int out_index = int(gl_WorkGroupID.z * gl_NumWorkGroups.y +
++                              gl_WorkGroupID.y);
+     const int tid = int(gl_LocalInvocationID.x);
+ 
++    const int out_total = p.out_w * p.out_h * p.out_d * p.out_c;
++    if (out_index >= out_total)
++        return;
++
+     int ow, oh, od, oc;
+     decode_out(out_index, ow, oh, od, oc);
+ 

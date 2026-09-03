@@ -1,0 +1,6 @@
+/build/
+/.cache/
+*.ncnn.bin
+*.ncnn.param
+*.f32
+*.log

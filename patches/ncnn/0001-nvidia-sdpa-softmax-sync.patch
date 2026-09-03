@@ -1,0 +1,19 @@
+diff --git a/src/layer/vulkan/sdpa_vulkan.cpp b/src/layer/vulkan/sdpa_vulkan.cpp
+index 2174ebc..aec34bf 100644
+--- a/src/layer/vulkan/sdpa_vulkan.cpp
++++ b/src/layer/vulkan/sdpa_vulkan.cpp
+@@ -642,6 +642,14 @@ int SDPA_vulkan::forward(const std::vector<VkMat>& bottom_blobs, std::vector<VkM
+ 
+     qk_softmax->forward_inplace(qk_cross, cmd, opt);
+ 
++    if (vkdev->info.vendor_id() == 0x10de)
++    {
++        // Match MultiHeadAttention_vulkan's NVIDIA workaround. Without a
++        // queue boundary here, Vulkan Softmax can intermittently produce NaN.
++        cmd.submit_and_wait();
++        cmd.reset();
++    }
++
+     VkMat& top_blob = top_blobs[0];
+     top_blob.create(out_embed_dim, src_seqlen, num_heads, elemsize, opt.blob_vkallocator);
+     if (top_blob.empty())
