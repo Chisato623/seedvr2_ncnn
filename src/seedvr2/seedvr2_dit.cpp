@@ -16,84 +16,6 @@ namespace seedvr2 {
 
 namespace {
 
-const char finite_check_shader[] = R"glsl(
-#version 450
-
-layout(binding = 0) readonly buffer input_blob { sfp input_data[]; };
-layout(binding = 1) buffer flag_blob { uint flag_data[]; };
-
-layout(push_constant) uniform parameter
-{
-    int count;
-    int flag_index;
-} p;
-
-void main()
-{
-    const int index = int(gl_GlobalInvocationID.x);
-    if (index >= p.count)
-        return;
-    const float value = float(buffer_ld1(input_data, index));
-    if (isnan(value) || isinf(value))
-        atomicOr(flag_data[p.flag_index], 1u);
-}
-)glsl";
-
-int create_finite_check_pipeline(const ncnn::Option& option,
-                                 const ncnn::VulkanDevice* device,
-                                 ncnn::Pipeline*& pipeline)
-{
-    std::vector<uint32_t> spirv;
-    int ret = ncnn::compile_spirv_module(finite_check_shader, option, spirv);
-    if (ret != 0)
-        return ret;
-    pipeline = new ncnn::Pipeline(device);
-    pipeline->set_local_size_xyz(256, 1, 1);
-    ret = pipeline->create(spirv.data(), spirv.size() * sizeof(uint32_t),
-                           std::vector<ncnn::vk_specialization_type>());
-    if (ret != 0)
-    {
-        delete pipeline;
-        pipeline = 0;
-    }
-    return ret;
-}
-
-int write_float_mat(const char* path, const ncnn::Mat& value)
-{
-    if (!path || !*path || value.empty() || value.elemsize != sizeof(float))
-        return -1;
-    std::FILE* file = std::fopen(path, "wb");
-    if (!file)
-        return -1;
-    const size_t count = value.total() * value.n;
-    const size_t written = std::fwrite(value.data, sizeof(float), count, file);
-    std::fclose(file);
-    return written == count ? 0 : -1;
-}
-
-std::vector<int> parse_checkpoint_blocks(const char* value)
-{
-    std::vector<int> blocks;
-    if (!value || !*value)
-        return blocks;
-
-    std::stringstream stream(value);
-    std::string item;
-    while (std::getline(stream, item, ','))
-    {
-        char* end = 0;
-        const long index = std::strtol(item.c_str(), &end, 10);
-        if (end == item.c_str() || *end != '\0' || index < 0 || index >= 32)
-        {
-            blocks.clear();
-            return blocks;
-        }
-        blocks.push_back(static_cast<int>(index));
-    }
-    return blocks;
-}
-
 int upload_pack1(const ncnn::Mat& source, ncnn::VkMat& destination,
                  ncnn::VulkanDevice* device, ncnn::VkCompute& command,
                  const ncnn::Option& option)
@@ -533,12 +455,6 @@ int SeedVR2DiTBlocks::load(const std::string& model_directory, int new_gpu_id,
         std::getenv("SEEDVR2_DIT_DISABLE_SHADER_LOCAL_MEMORY") != 0;
     const bool disable_subgroup_ops =
         std::getenv("SEEDVR2_DIT_DISABLE_SUBGROUP_OPS") != 0;
-    if (disable_cooperative_matrix)
-        std::fprintf(stderr, "SeedVR2 DiT cooperative-matrix kernels disabled\n");
-    if (disable_shader_local_memory)
-        std::fprintf(stderr, "SeedVR2 DiT shader-local-memory kernels disabled\n");
-    if (disable_subgroup_ops)
-        std::fprintf(stderr, "SeedVR2 DiT subgroup kernels disabled\n");
 
     frontend.opt.use_vulkan_compute = true;
     // FP16 activations diverge from the official model after block 5 because
@@ -632,80 +548,9 @@ int SeedVR2DiTBlocks::record_blocks(
     const ncnn::VkMat& video_shape, const ncnn::VkMat& text_length,
     const std::array<ncnn::VkMat, 6>& modulation,
     ncnn::VkCompute& command, ncnn::VkAllocator* blob_allocator,
-    ncnn::VkAllocator* staging_allocator,
-    const std::vector<int>& checkpoint_blocks,
-    std::vector<ncnn::Mat>& checkpoint_videos,
-    std::vector<ncnn::Mat>& checkpoint_texts) const
+    ncnn::VkAllocator* staging_allocator) const
 {
-    if (checkpoint_blocks.size() != checkpoint_videos.size() ||
-        checkpoint_blocks.size() != checkpoint_texts.size())
-        return -1;
-    const bool check_finite = std::getenv("SEEDVR2_DIT_CHECK_FINITE") != 0;
-    ncnn::Pipeline* finite_check_pipeline = 0;
-    ncnn::Option check_option;
-    if (check_finite)
-    {
-        check_option.use_vulkan_compute = true;
-        check_option.use_packing_layout = false;
-        check_option.use_fp16_storage = false;
-        check_option.use_fp16_packed = false;
-        check_option.use_bf16_storage = bf16_storage;
-        check_option.use_bf16_packed = false;
-        check_option.use_fp16_arithmetic = false;
-        check_option.blob_vkallocator = blob_allocator;
-        check_option.workspace_vkallocator = blob_allocator;
-        check_option.staging_vkallocator = staging_allocator;
-        const int pipeline_ret = create_finite_check_pipeline(
-            check_option, ncnn::get_gpu_device(gpu_id), finite_check_pipeline);
-        if (pipeline_ret != 0)
-            return pipeline_ret;
-    }
-
     int ret = 0;
-    if (check_finite)
-    {
-        ncnn::Mat flags(2);
-        std::memset(flags.data, 0, flags.total() * flags.elemsize);
-        ncnn::VkMat flags_gpu;
-        ncnn::Option flag_option = check_option;
-        flag_option.use_bf16_storage = false;
-        flag_option.use_bf16_packed = false;
-        command.record_upload(flags, flags_gpu, flag_option);
-        std::vector<ncnn::VkMat> bindings(2);
-        bindings[1] = flags_gpu;
-        std::vector<ncnn::vk_constant_type> constants(2);
-        ncnn::VkMat dispatcher;
-        bindings[0] = video;
-        constants[0].i = static_cast<int>(video.total() * video.elempack);
-        constants[1].i = 0;
-        dispatcher.w = constants[0].i;
-        dispatcher.h = 1;
-        dispatcher.c = 1;
-        command.record_pipeline(finite_check_pipeline, bindings, constants,
-                                dispatcher);
-        bindings[0] = text;
-        constants[0].i = static_cast<int>(text.total() * text.elempack);
-        constants[1].i = 1;
-        dispatcher.w = constants[0].i;
-        command.record_pipeline(finite_check_pipeline, bindings, constants,
-                                dispatcher);
-        command.record_download(flags_gpu, flags, flag_option);
-        ret = command.submit_and_wait();
-        command.reset();
-        if (ret == 0)
-        {
-            const unsigned int* flag_values =
-                static_cast<const unsigned int*>(flags.data);
-            std::fprintf(stderr,
-                         "SeedVR2 DiT frontend finite video=%d text=%d\n",
-                         flag_values[0] == 0 ? 1 : 0,
-                         flag_values[1] == 0 ? 1 : 0);
-            if (flag_values[0] != 0 || flag_values[1] != 0)
-                ret = -1;
-            else if (std::getenv("SEEDVR2_DIT_CHECK_FRONTEND_ONLY"))
-                ret = -2;
-        }
-    }
     for (size_t index = 0; ret == 0 && index < blocks.size(); index++)
     {
         Block& block = *blocks[index];
@@ -726,69 +571,6 @@ int SeedVR2DiTBlocks::record_blocks(
         }
         ncnn::VkMat next_video;
         ncnn::VkMat next_text;
-        ncnn::VkMat block0_qkv_input;
-        std::array<ncnn::VkMat, 9> block0_qkv_input_trace;
-        std::array<ncnn::VkMat, 4> block0_attention_boundaries;
-        const bool check_block0_attention =
-            check_finite && index == 0 &&
-            std::getenv("SEEDVR2_DIT_CHECK_BLOCK0_ATTENTION");
-        int block0_qkv_chunk_count = 0;
-        if (check_block0_attention)
-        {
-            if (std::getenv("SEEDVR2_DIT_CHECK_QKV_CHUNKS"))
-            {
-                const char* trace_names[] = {
-                    "1", "40", "41", "44", "45", "46", "47", "48", "50"};
-                for (int i = 0; ret == 0 && i < 9; i++)
-                    ret = extractor.extract(trace_names[i],
-                                            block0_qkv_input_trace[i], command);
-                ret = extractor.extract("50", block0_qkv_input, command);
-                if (ret == 0 && std::getenv("SEEDVR2_DIT_LOG_TENSORS"))
-                {
-                    for (int i = 0; i < 9; i++)
-                    {
-                        const ncnn::VkMat& value = block0_qkv_input_trace[i];
-                        std::fprintf(stderr,
-                                     "SeedVR2 DiT block 0 input trace %s "
-                                     "dims=%d w=%d h=%d elemsize=%zu "
-                                     "elempack=%d total=%zu range=%zu "
-                                     "offset=%zu\n",
-                                     trace_names[i], value.dims, value.w,
-                                     value.h, value.elemsize, value.elempack,
-                                     value.total(), value.buffer_capacity(),
-                                     value.buffer_offset());
-                    }
-                }
-            }
-            const char* names[] = {"62", "63", "64", "65"};
-            for (int i = 0; ret == 0 && i < 4; i++)
-                ret = extractor.extract(names[i],
-                                        block0_attention_boundaries[i],
-                                        command);
-            if (ret == 0 && std::getenv("SEEDVR2_DIT_LOG_TENSORS"))
-            {
-                for (int i = 0; i < 4; i++)
-                {
-                    const ncnn::VkMat& value = block0_attention_boundaries[i];
-                    std::fprintf(
-                        stderr,
-                        "SeedVR2 DiT block 0 blob %s dims=%d w=%d h=%d "
-                        "d=%d c=%d elemsize=%zu elempack=%d total=%zu "
-                        "range=%zu offset=%zu\n",
-                        names[i], value.dims, value.w, value.h, value.d,
-                        value.c, value.elemsize, value.elempack, value.total(),
-                        value.buffer_capacity(), value.buffer_offset());
-                }
-            }
-#if NCNN_BATCH
-            if (ret == 0 && std::getenv("SEEDVR2_DIT_CHECK_QKV_CHUNKS"))
-            {
-                const ncnn::VkMat& video_qkv = block0_attention_boundaries[0];
-                const int qkv_tokens = video_qkv.h * video_qkv.elempack;
-                block0_qkv_chunk_count = (qkv_tokens + 16383) / 16384;
-            }
-#endif
-        }
         if (ret == 0) ret = extractor.extract("out0", next_video, command);
         if (ret == 0) ret = extractor.extract("out1", next_text, command);
         if (ret != 0)
@@ -798,255 +580,7 @@ int SeedVR2DiTBlocks::record_blocks(
         }
         video = next_video;
         text = next_text;
-
-        if (check_finite)
-        {
-            const int block0_trace_count = block0_qkv_chunk_count ? 9 : 0;
-            std::array<ncnn::Mat, 3> block0_small_trace_cpu;
-            ncnn::Mat flags(check_block0_attention
-                                ? 6 + block0_qkv_chunk_count * 2 +
-                                      block0_trace_count
-                                : 2);
-            std::memset(flags.data, 0, flags.total() * flags.elemsize);
-            ncnn::VkMat flags_gpu;
-            ncnn::Option flag_option = check_option;
-            flag_option.use_bf16_storage = false;
-            flag_option.use_bf16_packed = false;
-            command.record_upload(flags, flags_gpu, flag_option);
-
-            std::vector<ncnn::VkMat> bindings(2);
-            bindings[1] = flags_gpu;
-            std::vector<ncnn::vk_constant_type> constants(2);
-            ncnn::VkMat dispatcher;
-            bindings[0] = video;
-            constants[0].i = static_cast<int>(video.total() * video.elempack);
-            constants[1].i = 0;
-            dispatcher.w = constants[0].i;
-            dispatcher.h = 1;
-            dispatcher.c = 1;
-            command.record_pipeline(finite_check_pipeline, bindings, constants,
-                                    dispatcher);
-
-            bindings[0] = text;
-            constants[0].i = static_cast<int>(text.total() * text.elempack);
-            constants[1].i = 1;
-            dispatcher.w = constants[0].i;
-            command.record_pipeline(finite_check_pipeline, bindings, constants,
-                                    dispatcher);
-            if (check_block0_attention)
-            {
-                for (int i = 0; i < 4; i++)
-                {
-                    bindings[0] = block0_attention_boundaries[i];
-                    constants[0].i = static_cast<int>(
-                        block0_attention_boundaries[i].total() *
-                        block0_attention_boundaries[i].elempack);
-                    constants[1].i = i + 2;
-                    dispatcher.w = constants[0].i;
-                    command.record_pipeline(finite_check_pipeline, bindings,
-                                            constants, dispatcher);
-                }
-#if NCNN_BATCH
-                const ncnn::VkMat& video_qkv = block0_attention_boundaries[0];
-                const int qkv_tokens = video_qkv.h * video_qkv.elempack;
-                for (int chunk = 0; chunk < block0_qkv_chunk_count; chunk++)
-                {
-                    const int token_offset = chunk * 16384;
-                    const int token_count = std::min(16384, qkv_tokens - token_offset);
-                    ncnn::VkMat qkv_chunk = video_qkv;
-                    qkv_chunk.h = token_count / qkv_chunk.elempack;
-                    qkv_chunk.cstep = ncnn::alignSize(
-                        static_cast<size_t>(qkv_chunk.w) * qkv_chunk.h *
-                            qkv_chunk.elemsize,
-                        16) /
-                                      qkv_chunk.elemsize;
-                    qkv_chunk.nstep = qkv_chunk.total();
-                    qkv_chunk.offset = video_qkv.offset +
-                                       static_cast<size_t>(
-                                           token_offset / qkv_chunk.elempack) *
-                                           qkv_chunk.w * qkv_chunk.elemsize;
-                    bindings[0] = qkv_chunk;
-                    constants[0].i = static_cast<int>(
-                        qkv_chunk.total() * qkv_chunk.elempack);
-                    constants[1].i = chunk + 6;
-                    dispatcher.w = constants[0].i;
-                    command.record_pipeline(finite_check_pipeline, bindings,
-                                            constants, dispatcher);
-
-                    ncnn::VkMat input_chunk = block0_qkv_input;
-                    input_chunk.h = token_count / input_chunk.elempack;
-                    input_chunk.cstep = ncnn::alignSize(
-                        static_cast<size_t>(input_chunk.w) * input_chunk.h *
-                            input_chunk.elemsize,
-                        16) /
-                                        input_chunk.elemsize;
-                    input_chunk.nstep = input_chunk.total();
-                    input_chunk.offset = block0_qkv_input.offset +
-                                         static_cast<size_t>(
-                                             token_offset /
-                                             input_chunk.elempack) *
-                                             input_chunk.w *
-                                             input_chunk.elemsize;
-                    bindings[0] = input_chunk;
-                    constants[0].i = static_cast<int>(
-                        input_chunk.total() * input_chunk.elempack);
-                    constants[1].i = chunk + 6 + block0_qkv_chunk_count;
-                    dispatcher.w = constants[0].i;
-                    command.record_pipeline(finite_check_pipeline, bindings,
-                                            constants, dispatcher);
-                }
-                for (int i = 0; i < block0_trace_count; i++)
-                {
-                    bindings[0] = block0_qkv_input_trace[i];
-                    constants[0].i = static_cast<int>(
-                        block0_qkv_input_trace[i].total() *
-                        block0_qkv_input_trace[i].elempack);
-                    constants[1].i = 6 + block0_qkv_chunk_count * 2 + i;
-                    dispatcher.w = constants[0].i;
-                    command.record_pipeline(finite_check_pipeline, bindings,
-                                            constants, dispatcher);
-                }
-                if (block0_trace_count)
-                {
-                    command.record_download(block0_qkv_input_trace[2],
-                                            block0_small_trace_cpu[0],
-                                            check_option);
-                    command.record_download(block0_qkv_input_trace[3],
-                                            block0_small_trace_cpu[1],
-                                            check_option);
-                    command.record_download(block0_qkv_input_trace[4],
-                                            block0_small_trace_cpu[2],
-                                            check_option);
-                }
-#endif
-            }
-            command.record_download(flags_gpu, flags, flag_option);
-            ret = command.submit_and_wait();
-            command.reset();
-            if (ret != 0)
-                break;
-            const unsigned int* flag_values =
-                static_cast<const unsigned int*>(flags.data);
-            std::fprintf(stderr,
-                         "SeedVR2 DiT block %zu finite video=%d text=%d\n",
-                         index, flag_values[0] == 0 ? 1 : 0,
-                         flag_values[1] == 0 ? 1 : 0);
-            if (check_block0_attention)
-            {
-                std::fprintf(
-                    stderr,
-                    "SeedVR2 DiT block 0 attention finite "
-                    "video_qkv=%d text_qkv=%d video_out=%d text_out=%d\n",
-                    flag_values[2] == 0 ? 1 : 0,
-                    flag_values[3] == 0 ? 1 : 0,
-                    flag_values[4] == 0 ? 1 : 0,
-                    flag_values[5] == 0 ? 1 : 0);
-                for (int chunk = 0; chunk < block0_qkv_chunk_count; chunk++)
-                {
-                    const ncnn::VkMat& video_qkv = block0_attention_boundaries[0];
-                    const int token_offset = chunk * 16384;
-                    const int token_count = std::min(
-                        16384,
-                        video_qkv.h * video_qkv.elempack - token_offset);
-                    const size_t byte_offset = video_qkv.buffer_offset() +
-                                               static_cast<size_t>(
-                                                   token_offset /
-                                                   video_qkv.elempack) *
-                                                   video_qkv.w *
-                                                   video_qkv.elemsize;
-                    const size_t byte_range =
-                        static_cast<size_t>(token_count /
-                                            video_qkv.elempack) *
-                        video_qkv.w * video_qkv.elemsize;
-                    std::fprintf(stderr,
-                                 "SeedVR2 DiT block 0 video QKV chunk %d "
-                                 "tokens=%d:%d input_finite=%d output_finite=%d "
-                                 "offset=%zu range=%zu\n",
-                                 chunk, token_offset,
-                                 token_offset + token_count,
-                                 flag_values[chunk + 6 +
-                                             block0_qkv_chunk_count] == 0
-                                     ? 1
-                                     : 0,
-                                 flag_values[chunk + 6] == 0 ? 1 : 0,
-                                 byte_offset, byte_range);
-                }
-                if (block0_trace_count)
-                {
-                    const char* trace_names[] = {
-                        "1", "40", "41", "44", "45", "46", "47", "48", "50"};
-                    for (int i = 0; i < block0_trace_count; i++)
-                    {
-                        std::fprintf(
-                            stderr,
-                            "SeedVR2 DiT block 0 input trace %s finite=%d\n",
-                            trace_names[i],
-                            flag_values[6 + block0_qkv_chunk_count * 2 + i] == 0
-                                ? 1
-                                : 0);
-                    }
-                    const char* small_names[] = {"41", "44", "45"};
-                    for (int i = 0; i < 3; i++)
-                    {
-                        const ncnn::Mat& value = block0_small_trace_cpu[i];
-                        const float* values = static_cast<const float*>(value.data);
-                        const size_t count = value.total() * value.elempack;
-                        float minimum = INFINITY;
-                        float maximum = -INFINITY;
-                        size_t nonpositive = 0;
-                        size_t nonfinite = 0;
-                        size_t first_nonfinite = count;
-                        for (size_t j = 0; j < count; j++)
-                        {
-                            const float scalar = values[j];
-                            if (!std::isfinite(scalar))
-                            {
-                                nonfinite++;
-                                if (first_nonfinite == count)
-                                    first_nonfinite = j;
-                                continue;
-                            }
-                            minimum = std::min(minimum, scalar);
-                            maximum = std::max(maximum, scalar);
-                            if (scalar <= 0.f)
-                                nonpositive++;
-                        }
-                        std::fprintf(stderr,
-                                     "SeedVR2 DiT block 0 input trace %s "
-                                     "values=%zu min=%.9g max=%.9g "
-                                     "nonpositive=%zu nonfinite=%zu "
-                                     "first_nonfinite=%zu\n",
-                                     small_names[i], count, minimum, maximum,
-                                     nonpositive, nonfinite, first_nonfinite);
-                    }
-                }
-            }
-            if (flag_values[0] != 0 || flag_values[1] != 0)
-            {
-                ret = -1;
-                break;
-            }
-        }
-        for (size_t checkpoint = 0; checkpoint < checkpoint_blocks.size(); checkpoint++)
-        {
-            if (static_cast<int>(index) != checkpoint_blocks[checkpoint])
-                continue;
-            ncnn::Option option;
-            option.use_vulkan_compute = true;
-            option.use_packing_layout = false;
-            option.use_fp16_storage = false;
-            option.use_fp16_packed = false;
-            option.use_bf16_storage = bf16_storage;
-            option.use_bf16_packed = false;
-            option.use_fp16_arithmetic = false;
-            option.blob_vkallocator = blob_allocator;
-            option.workspace_vkallocator = blob_allocator;
-            option.staging_vkallocator = staging_allocator;
-            command.record_download(video, checkpoint_videos[checkpoint], option);
-            command.record_download(text, checkpoint_texts[checkpoint], option);
-        }
     }
-    delete finite_check_pipeline;
     return ret;
 }
 
@@ -1114,15 +648,11 @@ int SeedVR2DiTBlocks::forward(const DiTBlockInputs& inputs,
         for (int i = 0; ret == 0 && i < 6; i++)
             ret = upload_pack1(inputs.modulation[i], modulation[i], device, command, option);
 
-        std::vector<int> checkpoint_blocks;
-        std::vector<ncnn::Mat> checkpoint_videos;
-        std::vector<ncnn::Mat> checkpoint_texts;
         if (ret == 0)
             ret = record_blocks(inputs.video_shapes, inputs.text_lengths,
                                 video, text, video_shape_gpu, text_length_gpu,
                                 modulation, command, blob_allocator,
-                                staging_allocator, checkpoint_blocks,
-                                checkpoint_videos, checkpoint_texts);
+                                staging_allocator);
 
         if (ret == 0)
         {
@@ -1312,40 +842,6 @@ int SeedVR2DiTBlocks::forward(const DiTInputs& inputs,
     option.blob_vkallocator = blob_allocator;
     option.workspace_vkallocator = blob_allocator;
     option.staging_vkallocator = staging_allocator;
-    const char* checkpoint_path = std::getenv("SEEDVR2_DIT_DUMP_BLOCK");
-    const char* checkpoint_index_value =
-        std::getenv("SEEDVR2_DIT_DUMP_BLOCK_INDEX");
-    std::vector<int> checkpoint_blocks;
-    std::vector<std::string> checkpoint_paths;
-    std::vector<std::string> checkpoint_text_paths;
-    if (checkpoint_path && checkpoint_index_value)
-    {
-        checkpoint_blocks.push_back(std::atoi(checkpoint_index_value));
-        checkpoint_paths.push_back(checkpoint_path);
-        checkpoint_text_paths.push_back(std::string(checkpoint_path) + ".text.f32");
-    }
-    const char* checkpoint_list = std::getenv("SEEDVR2_DIT_DUMP_BLOCKS");
-    const char* checkpoint_directory = std::getenv("SEEDVR2_DIT_DUMP_DIR");
-    if (checkpoint_list && checkpoint_directory)
-    {
-        const std::vector<int> parsed = parse_checkpoint_blocks(checkpoint_list);
-        if (parsed.empty())
-            return -1;
-        for (size_t i = 0; i < parsed.size(); i++)
-        {
-            checkpoint_blocks.push_back(parsed[i]);
-            checkpoint_paths.push_back(std::string(checkpoint_directory) +
-                                       "/ncnn_block" + std::to_string(parsed[i]) +
-                                       ".f32");
-            checkpoint_text_paths.push_back(std::string(checkpoint_directory) +
-                                            "/ncnn_block" + std::to_string(parsed[i]) +
-                                            "_text.f32");
-        }
-    }
-    std::vector<ncnn::Mat> checkpoint_videos(checkpoint_blocks.size());
-    std::vector<ncnn::Mat> checkpoint_texts(checkpoint_blocks.size());
-    std::array<ncnn::Mat, 6> checkpoint_modulations;
-
     {
         ncnn::VkCompute command(device);
         ncnn::VkMat patchified_video_gpu;
@@ -1404,8 +900,7 @@ int SeedVR2DiTBlocks::forward(const DiTInputs& inputs,
             ret = record_blocks(patchified_shapes, inputs.text_lengths,
                                 video, text, video_shape_gpu, text_length_gpu,
                                 modulation, command, blob_allocator,
-                                staging_allocator, checkpoint_blocks,
-                                checkpoint_videos, checkpoint_texts);
+                                staging_allocator);
         ncnn::VkMat patchified_prediction;
         if (ret == 0)
         {
@@ -1425,36 +920,12 @@ int SeedVR2DiTBlocks::forward(const DiTInputs& inputs,
             command.record_download(patchified_prediction,
                                     patchified_prediction_cpu, option);
             command.record_download(text, text_output, option);
-            if (checkpoint_list && checkpoint_directory)
-            {
-                for (int i = 0; i < 6; i++)
-                    command.record_download(modulation[i], checkpoint_modulations[i], option);
-            }
             ret = command.submit_and_wait();
         }
         if (ret == 0)
             ret = unpatchify_prediction(patchified_prediction_cpu,
                                         inputs.video_shapes, patchified_shapes,
                                         video_output);
-        for (size_t i = 0; ret == 0 && i < checkpoint_blocks.size(); i++)
-        {
-            if (write_float_mat(checkpoint_paths[i].c_str(), checkpoint_videos[i]) != 0)
-                ret = -1;
-            if (ret == 0 &&
-                write_float_mat(checkpoint_text_paths[i].c_str(), checkpoint_texts[i]) != 0)
-                ret = -1;
-        }
-        if (ret == 0 && checkpoint_list && checkpoint_directory)
-        {
-            for (int i = 0; ret == 0 && i < 6; i++)
-            {
-                const std::string path = std::string(checkpoint_directory) +
-                                         "/ncnn_modulation" + std::to_string(i) +
-                                         ".f32";
-                if (write_float_mat(path.c_str(), checkpoint_modulations[i]) != 0)
-                    ret = -1;
-            }
-        }
     }
 
     device->reclaim_blob_allocator(blob_allocator);

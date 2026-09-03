@@ -2,8 +2,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <memory>
 
@@ -767,20 +765,6 @@ int AdaptiveWindowAttention::forward(const std::vector<ncnn::Mat>& bottom_blobs,
                                      std::vector<ncnn::Mat>& top_blobs,
                                      const ncnn::Option& opt) const
 {
-    if (std::getenv("SEEDVR2_ATTENTION_LOG_INPUTS"))
-    {
-        std::fprintf(stderr, "SeedVR2 attention CPU inputs=%zu\n",
-                     bottom_blobs.size());
-        for (size_t index = 0; index < bottom_blobs.size(); index++)
-        {
-            const ncnn::Mat& value = bottom_blobs[index];
-            std::fprintf(stderr,
-                         "  input[%zu] dims=%d w=%d h=%d elemsize=%zu "
-                         "elempack=%d\n",
-                         index, value.dims, value.w, value.h, value.elemsize,
-                         value.elempack);
-        }
-    }
     const bool split_qkv = bottom_blobs.size() == 8;
     if ((!split_qkv && bottom_blobs.size() != 4) || top_blobs.size() != 2 || heads <= 0 || head_dim <= 0 ||
         rope_pairs_per_axis * 6 > head_dim || video_norm_q.empty() || video_norm_k.empty() ||
@@ -1077,20 +1061,6 @@ int AdaptiveWindowAttention::forward(const std::vector<ncnn::VkMat>& bottom_blob
                                      ncnn::VkCompute& cmd,
                                      const ncnn::Option& opt) const
 {
-    if (std::getenv("SEEDVR2_ATTENTION_LOG_INPUTS"))
-    {
-        std::fprintf(stderr, "SeedVR2 attention Vulkan inputs=%zu\n",
-                     bottom_blobs.size());
-        for (size_t index = 0; index < bottom_blobs.size(); index++)
-        {
-            const ncnn::VkMat& value = bottom_blobs[index];
-            std::fprintf(stderr,
-                         "  input[%zu] dims=%d w=%d h=%d elemsize=%zu "
-                         "elempack=%d elembits=%d\n",
-                         index, value.dims, value.w, value.h, value.elemsize,
-                         value.elempack, value.elembits());
-        }
-    }
     const bool split_qkv = bottom_blobs.size() == 8;
     if ((!split_qkv && bottom_blobs.size() != 4) || top_blobs.size() != 2 || !runtime_state ||
         runtime_state->video_shapes.empty() ||

@@ -6,7 +6,6 @@
 #include "vae_upsample3d.h"
 
 #include <algorithm>
-#include <cmath>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -20,99 +19,6 @@ bool environment_enabled(const char* name)
 {
     const char* value = std::getenv(name);
     return value && value[0] && std::strcmp(value, "0") != 0;
-}
-
-int environment_index(const char* name)
-{
-    const char* value = std::getenv(name);
-    return value && value[0] ? std::atoi(value) : -1;
-}
-
-const char* memory_state_name(MemoryState state)
-{
-    switch (state)
-    {
-    case MemoryState::DISABLED: return "disabled";
-    case MemoryState::INITIALIZING: return "initializing";
-    case MemoryState::ACTIVE: return "active";
-    }
-    return "unknown";
-}
-
-bool should_trace_blob(int layer_index, int blob_index)
-{
-    if (!environment_enabled("SEEDVR2_VAE_TRACE_BLOBS"))
-        return false;
-    const int requested_layer = environment_index("SEEDVR2_VAE_TRACE_LAYER");
-    const int requested_blob = environment_index("SEEDVR2_VAE_TRACE_BLOB");
-    return (requested_layer < 0 || requested_layer == layer_index) &&
-           (requested_blob < 0 || requested_blob == blob_index);
-}
-
-int dump_layer_index()
-{
-    return environment_index("SEEDVR2_VAE_DUMP_LAYER");
-}
-
-bool dump_layer_requested(int layer_index)
-{
-    const char* list = std::getenv("SEEDVR2_VAE_DUMP_LAYERS");
-    if (list && list[0])
-    {
-        const char* cursor = list;
-        while (*cursor)
-        {
-            char* end = 0;
-            const long value = std::strtol(cursor, &end, 10);
-            if (end != cursor && value == layer_index)
-                return true;
-            if (!end || end == cursor)
-                break;
-            cursor = *end == ',' ? end + 1 : end;
-        }
-    }
-    return dump_layer_index() == layer_index;
-}
-
-int dump_mat_f32(const char* path, const ncnn::Mat& value)
-{
-    if (!path || !path[0] || value.empty() || value.elempack != 1 ||
-        value.elemsize != sizeof(float))
-        return -1;
-
-    std::FILE* file = std::fopen(path, "wb");
-    if (!file)
-        return -1;
-    size_t written = 0;
-    bool valid = true;
-    if (value.dims == 4 && value.n == 1)
-    {
-        // Reshape views can retain a source cstep.  Serialize logical rows
-        // instead of assuming that value.data is a contiguous CTHW array.
-        for (int channel = 0; channel < value.c && valid; channel++)
-        {
-            for (int depth = 0; depth < value.d && valid; depth++)
-            {
-                const ncnn::Mat plane = value.channel(channel).depth(depth);
-                for (int row = 0; row < value.h && valid; row++)
-                {
-                    const size_t count = static_cast<size_t>(value.w);
-                    const size_t wrote = std::fwrite(
-                        plane.row(row), sizeof(float), count, file);
-                    written += wrote;
-                    valid = wrote == count;
-                }
-            }
-        }
-    }
-    else
-    {
-        const size_t count = value.total() * value.n;
-        written = std::fwrite(value.data, sizeof(float), count, file);
-        valid = written == count;
-    }
-    const int close_ret = std::fclose(file);
-    return valid && close_ret == 0 ? 0 : -1;
 }
 
 bool release_completed_temporal_memory(const ncnn::Layer* layer)
@@ -268,20 +174,11 @@ int concatenate_temporal(const std::vector<ncnn::Mat>& segments,
 int extract_segment(const ncnn::Net& net, const ncnn::Mat& input,
                     MemoryState memory_state,
                     ncnn::VkAllocator* memory_vkallocator,
-                    int segment_index, int segment_start,
+                    int segment_index,
                     ncnn::Mat& output)
 {
     set_vae_memory_state(memory_state);
     set_vae_memory_vkallocator(memory_vkallocator);
-    const bool trace_progress =
-        environment_enabled("SEEDVR2_VAE_TRACE_PROGRESS");
-    if (trace_progress)
-        std::fprintf(stderr,
-                     "SeedVR2 VAE segment=%d start=%d frames=%d state=%s "
-                     "input=(%d,%d,%d,%d) begin\n",
-                     segment_index, segment_start, input.d,
-                     memory_state_name(memory_state), input.w, input.h,
-                     input.d, input.c);
     const ncnn::VulkanDevice* device = net.vulkan_device();
     if (!device)
     {
@@ -320,10 +217,6 @@ int extract_segment(const ncnn::Net& net, const ncnn::Mat& input,
             std::fprintf(stderr,
                          "SeedVR2 VAE failure segment=%d stage=input ret=%d\n",
                          segment_index, ret);
-        const char* check_layer_value = std::getenv("SEEDVR2_VAE_CHECK_LAYER");
-        const int check_layer = check_layer_value
-                                    ? std::atoi(check_layer_value) : -1;
-        const char* dump_path = std::getenv("SEEDVR2_VAE_DUMP_PATH");
         const std::vector<ncnn::Layer*>& layers = net.layers();
         for (size_t layer_index = 0; layer_index < layers.size(); layer_index++)
         {
@@ -332,12 +225,6 @@ int extract_segment(const ncnn::Net& net, const ncnn::Mat& input,
                 break;
             for (int blob_index : layer->tops)
             {
-                const bool trace_blob = should_trace_blob(
-                    static_cast<int>(layer_index), blob_index);
-                if (trace_blob)
-                    std::fprintf(stderr,
-                                 "SeedVR2 VAE layer=%zu name=%s blob=%d begin\n",
-                                 layer_index, layer->name.c_str(), blob_index);
                 {
                     ncnn::VkCompute command(device);
                     ncnn::VkMat checkpoint;
@@ -351,91 +238,6 @@ int extract_segment(const ncnn::Net& net, const ncnn::Mat& input,
                                      "stage=checkpoint ret=%d\n",
                                      segment_index, layer_index,
                                      layer->name.c_str(), blob_index, ret);
-                    else if (trace_blob)
-                        std::fprintf(stderr,
-                                     "SeedVR2 VAE layer=%zu name=%s blob=%d "
-                                     "shape=(%d,%d,%d,%d,%d) done\n",
-                                     layer_index, layer->name.c_str(),
-                                     blob_index, checkpoint.w, checkpoint.h,
-                                     checkpoint.d, checkpoint.c,
-                                     checkpoint.n);
-                    const bool inspect_layer =
-                        static_cast<int>(layer_index) == check_layer ||
-                        dump_layer_requested(static_cast<int>(layer_index));
-                    if (ret == 0 && inspect_layer)
-                    {
-                        ncnn::Mat checked;
-                        ret = extractor.extract(blob_index, checked);
-                        bool finite = ret == 0 && !checked.empty();
-                        const float* values = checked;
-                        for (size_t index = 0;
-                             finite && index < checked.total() * checked.n;
-                             index++)
-                            finite = std::isfinite(values[index]);
-                        if (ret == 0 && !checked.empty())
-                        {
-                            double sum = 0.0;
-                            double square_sum = 0.0;
-                            float minimum = INFINITY;
-                            float maximum = -INFINITY;
-                            const size_t count = checked.total() * checked.n;
-                            for (size_t index = 0; index < count; index++)
-                            {
-                                const float value = values[index];
-                                sum += value;
-                                square_sum += static_cast<double>(value) * value;
-                                minimum = std::min(minimum, value);
-                                maximum = std::max(maximum, value);
-                            }
-                            std::fprintf(stderr,
-                                         "SeedVR2 VAE stats layer=%zu name=%s "
-                                         "count=%zu min=%.9g max=%.9g mean=%.9g rms=%.9g\\n",
-                                         layer_index, layer->name.c_str(), count,
-                                         minimum, maximum, sum / count,
-                                         std::sqrt(square_sum / count));
-                        }
-                        std::fprintf(stderr,
-                                     "SeedVR2 VAE check layer=%zu name=%s "
-                                     "blob=%d shape=(%d,%d,%d,%d,%d) "
-                                     "finite=%d\n",
-                                     layer_index, layer->name.c_str(),
-                                     blob_index, checked.w, checked.h,
-                                     checked.d, checked.c, checked.n,
-                                     finite ? 1 : 0);
-                        if (!finite)
-                        {
-                            std::fprintf(stderr,
-                                         "SeedVR2 VAE failure segment=%d "
-                                         "layer=%zu name=%s blob=%d "
-                                         "stage=nonfinite\n",
-                                         segment_index, layer_index,
-                                         layer->name.c_str(), blob_index);
-                            ret = -1;
-                        }
-                        if (ret == 0 && dump_layer_requested(static_cast<int>(layer_index)) &&
-                            dump_path && dump_path[0])
-                        {
-                            std::string resolved_path = dump_path;
-                            if (std::getenv("SEEDVR2_VAE_DUMP_LAYERS"))
-                            {
-                                resolved_path += ".layer" +
-                                                 std::to_string(layer_index) +
-                                                 ".blob" +
-                                                 std::to_string(blob_index) +
-                                                 ".f32";
-                            }
-                            const int dump_ret =
-                                dump_mat_f32(resolved_path.c_str(), checked);
-                            std::fprintf(stderr,
-                                         "SeedVR2 VAE dump layer=%zu name=%s "
-                                         "blob=%d write=%d path=%s\n",
-                                         layer_index, layer->name.c_str(),
-                                         blob_index, dump_ret,
-                                         resolved_path.c_str());
-                            if (dump_ret != 0)
-                                ret = dump_ret;
-                        }
-                    }
                 }
                 // submit_and_wait() has completed and both command/checkpoint
                 // are gone, so blocks returned by light-mode execution are no
@@ -455,11 +257,6 @@ int extract_segment(const ncnn::Net& net, const ncnn::Mat& input,
             std::fprintf(stderr,
                          "SeedVR2 VAE failure segment=%d stage=output ret=%d\n",
                          segment_index, ret);
-        else if (trace_progress)
-            std::fprintf(stderr,
-                         "SeedVR2 VAE segment=%d output=(%d,%d,%d,%d) done\n",
-                         segment_index, output.w, output.h, output.d,
-                         output.c);
     }
     graph_allocator->trim();
     device->reclaim_blob_allocator(blob_allocator);
@@ -478,7 +275,7 @@ int extract_temporal_slices(const ncnn::Net& net, const ncnn::Mat& input,
     if (input.d <= first_size)
     {
         const int ret = extract_segment(
-            net, input, MemoryState::DISABLED, memory_vkallocator, 0, 0,
+            net, input, MemoryState::DISABLED, memory_vkallocator, 0,
             output);
         finish_temporal_memory(net, memory_vkallocator);
         return ret;
@@ -497,7 +294,7 @@ int extract_temporal_slices(const ncnn::Net& net, const ncnn::Mat& input,
         ncnn::Mat segment_output;
         if (ret == 0)
             ret = extract_segment(net, segment, state, memory_vkallocator,
-                                  segment_index, start, segment_output);
+                                  segment_index, segment_output);
         if (ret != 0)
         {
             finish_temporal_memory(net, memory_vkallocator);
