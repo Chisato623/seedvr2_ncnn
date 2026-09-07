@@ -17,6 +17,7 @@ struct PipelineOptions
     float cfg_scale = 1.f;
     float cfg_rescale = 0.f;
     uint64_t seed = 666;
+    bool sample_vae_posterior = true;
     ncnn::Mat initial_noise;
 };
 

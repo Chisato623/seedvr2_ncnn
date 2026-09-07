@@ -33,12 +33,18 @@ struct DiTInputs
     std::vector<float> timesteps;
 };
 
+// Validate a flattened batch and return one zero-copy Mat view per sample.
+// The views retain the input storage, so the source Mats must outlive them.
 int split_dit_inputs_by_sample(const DiTInputs& inputs,
                                std::vector<DiTInputs>& samples);
 int split_dit_block_inputs_by_sample(
     const DiTBlockInputs& inputs,
     std::vector<DiTBlockInputs>& samples);
 
+    // Vulkan runtime for the exported frontend, complete 32-block DiT graph,
+    // and output projection. Inputs are uploaded once, the three stage graphs
+    // execute on one shared VkCompute command stream, and only the final
+    // prediction/text are downloaded.
 class SeedVR2DiTBlocks
 {
 public:
@@ -56,7 +62,7 @@ public:
     void clear();
 
 private:
-    struct Block;
+    struct BlockGraph;
     int record_blocks(const std::vector<std::array<int, 3> >& video_shapes,
                       const std::vector<int>& text_lengths,
                       ncnn::VkMat& video, ncnn::VkMat& text,
@@ -65,11 +71,14 @@ private:
                       const std::array<ncnn::VkMat, 6>& modulation,
                       ncnn::VkCompute& command,
                       ncnn::VkAllocator* blob_allocator,
-                      ncnn::VkAllocator* staging_allocator) const;
+                      ncnn::VkAllocator* staging_allocator,
+                      const std::vector<int>& checkpoint_blocks,
+                      std::vector<ncnn::Mat>& checkpoint_videos,
+                      std::vector<ncnn::Mat>& checkpoint_texts) const;
 
     ncnn::Net frontend;
     ncnn::Net tail;
-    std::vector<std::unique_ptr<Block> > blocks;
+    std::unique_ptr<BlockGraph> block_graph;
     int gpu_id;
     bool bf16_storage;
     bool frontend_loaded;

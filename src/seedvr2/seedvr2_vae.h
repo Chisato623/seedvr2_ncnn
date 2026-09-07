@@ -1,11 +1,18 @@
 #ifndef SEEDVR2_VAE_H
 #define SEEDVR2_VAE_H
 
+#include <cstdint>
 #include <string>
 
 #include <net.h>
 
 namespace seedvr2 {
+
+struct VAEEncodeOptions
+{
+    bool sample_posterior = true;
+    uint64_t seed = 666;
+};
 
 // Dynamic spatiotemporal runtime for the official SeedVR2 VAE. Encoder inputs
 // longer than five frames are sliced as 5 + 4n and decoder inputs longer than
@@ -20,7 +27,8 @@ public:
 
     int load(const std::string& model_directory, int gpu_id = 0);
     int encode_moments(const ncnn::Mat& video, ncnn::Mat& moments) const;
-    int encode(const ncnn::Mat& video, ncnn::Mat& latent) const;
+    int encode(const ncnn::Mat& video, ncnn::Mat& latent,
+               const VAEEncodeOptions& options = VAEEncodeOptions()) const;
     int decode(const ncnn::Mat& latent, ncnn::Mat& video) const;
     void clear();
 

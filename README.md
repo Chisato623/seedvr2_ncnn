@@ -81,8 +81,12 @@ are encoded by FFmpeg.
   --gpu 0 --steps 1 --cfg-scale 1
 ```
 
-The expected DiT model directory contains `frontend/`, `block_00/` through
-`block_31/`, and `tail/`, each with its `.ncnn.param` and `.ncnn.bin` files.
+The expected DiT model directory contains `frontend/`, `blocks/`, and `tail/`.
+The `blocks/` directory contains the complete fused graph
+`seedvr2_blocks.ncnn.param` and `seedvr2_blocks.ncnn.bin`; it is loaded as one
+runtime graph rather than loading 32 block networks independently. The graph
+requires the registered `AdaptiveWindowAttention` and `SharedLinear` custom
+layers.
 The VAE model directory contains `seedvr2_vae_encoder.ncnn.param/.bin` and
 `seedvr2_vae_decoder.ncnn.param/.bin`.
 

@@ -47,6 +47,85 @@ bool all_finite(const ncnn::Mat& value)
     return true;
 }
 
+void dump_if_requested(const char* environment_name, const ncnn::Mat& value)
+{
+    const char* path = std::getenv(environment_name);
+    if (!path || !*path)
+        return;
+    std::FILE* file = std::fopen(path, "wb");
+    if (!file)
+    {
+        std::fprintf(stderr, "failed to open %s dump %s\n",
+                     environment_name, path);
+        return;
+    }
+    const size_t count = value.total() * value.n;
+    const size_t written = std::fwrite(value.data, sizeof(float), count, file);
+    std::fclose(file);
+    if (written != count)
+        std::fprintf(stderr, "short write for %s dump %s\n",
+                     environment_name, path);
+}
+
+int load_condition_if_requested(const ncnn::Mat& video, ncnn::Mat& condition)
+{
+    const char* path = std::getenv("SEEDVR2_LOAD_CONDITION");
+    if (!path || !*path)
+        return 1;
+    const int latent_frames = video.d == 1 ? 1 : (video.d - 1) / 4 + 1;
+    condition.create(video.w / 8, video.h / 8, latent_frames, 16);
+    if (condition.empty())
+        return -100;
+    std::FILE* file = std::fopen(path, "rb");
+    if (!file)
+        return -1;
+    const size_t count = condition.total() * condition.n;
+    const size_t read = std::fread(condition.data, sizeof(float), count, file);
+    const int trailing = std::fgetc(file);
+    std::fclose(file);
+    if (read != count || trailing != EOF)
+    {
+        condition.release();
+        return -1;
+    }
+    return 0;
+}
+
+int load_denoised_if_requested(const ncnn::Mat& condition, ncnn::Mat& latent)
+{
+    const char* path = std::getenv("SEEDVR2_LOAD_DENOISED");
+    if (!path || !*path)
+        return 1;
+    latent.create(condition.w, condition.h, condition.d, 16);
+    if (latent.empty())
+        return -100;
+    const size_t count = latent.total() * latent.n;
+    std::FILE* file = std::fopen(path, "rb");
+    if (!file)
+        return -1;
+    const size_t read = std::fread(latent.data, sizeof(float), count, file);
+    const int trailing = std::fgetc(file);
+    std::fclose(file);
+    if (read != count || trailing != EOF)
+    {
+        latent.release();
+        return -1;
+    }
+    return 0;
+}
+
+void trace_layout(const char* label, const ncnn::Mat& value)
+{
+    if (!std::getenv("SEEDVR2_TRACE_LAYOUT"))
+        return;
+    std::fprintf(stderr,
+                 "SeedVR2 layout %s dims=%d w=%d h=%d d=%d c=%d n=%d "
+                 "cstep=%zu elemsize=%zu elempack=%d total=%zu data=%p\n",
+                 label, value.dims, value.w, value.h, value.d, value.c,
+                 value.n, value.cstep, value.elemsize, value.elempack,
+                 value.total(), value.data);
+}
+
 int copy_video_frames(const ncnn::Mat& source, int output_frames,
                       bool repeat_last, ncnn::Mat& destination)
 {
@@ -266,33 +345,62 @@ int SeedVR2Pipeline::restore(const ncnn::Mat& input_video,
         return ret;
 
     ncnn::Mat condition;
-    if (staged)
+    const int condition_load_ret =
+        load_condition_if_requested(padded_video, condition);
+    if (condition_load_ret < 0)
     {
-        ret = load_vae_stage();
+        std::fprintf(stderr, "SeedVR2 diagnostic condition load failed (%d)\n",
+                     condition_load_ret);
+        return condition_load_ret;
+    }
+    if (condition_load_ret > 0)
+    {
+        if (staged)
+        {
+            ret = load_vae_stage();
+            if (ret != 0)
+            {
+                std::fprintf(stderr,
+                             "SeedVR2 staged VAE encode load failed (%d)\n",
+                             ret);
+                return ret;
+            }
+        }
+
+        VAEEncodeOptions encode_options;
+        encode_options.sample_posterior = options.sample_vae_posterior;
+        encode_options.seed = options.seed;
+        ret = vae.encode(padded_video, condition, encode_options);
+        if (staged)
+            clear_vae_stage();
         if (ret != 0)
         {
-            std::fprintf(stderr,
-                         "SeedVR2 staged VAE encode load failed (%d)\n",
-                         ret);
+            std::fprintf(stderr, "SeedVR2 VAE encode failed (%d)\n", ret);
             return ret;
         }
-    }
-
-    ret = vae.encode(padded_video, condition);
-    if (staged)
-        clear_vae_stage();
-    if (ret != 0)
-    {
-        std::fprintf(stderr, "SeedVR2 VAE encode failed (%d)\n", ret);
-        return ret;
     }
     if (!all_finite(condition))
     {
         std::fprintf(stderr, "SeedVR2 VAE encode produced non-finite values\n");
         return -1;
     }
+    dump_if_requested("SEEDVR2_DUMP_CONDITION", condition);
+    if (std::getenv("SEEDVR2_CONDITION_ONLY"))
+    {
+        output_video = condition;
+        return 0;
+    }
+
     ncnn::Mat latent;
-    if (!options.initial_noise.empty())
+    const int denoised_load_ret = load_denoised_if_requested(condition, latent);
+    if (denoised_load_ret < 0)
+        return denoised_load_ret;
+    const bool loaded_denoised = denoised_load_ret == 0;
+    if (loaded_denoised)
+    {
+        // The diagnostic latent has already been loaded above.
+    }
+    else if (!options.initial_noise.empty())
     {
         if (!is_latent(options.initial_noise) ||
             options.initial_noise.w != condition.w ||
@@ -316,7 +424,9 @@ int SeedVR2Pipeline::restore(const ncnn::Mat& input_video,
     if (latent.empty())
         return -100;
 
-    if (staged)
+    trace_layout("condition", condition);
+    trace_layout("latent_before_dit", latent);
+    if (staged && !loaded_denoised)
     {
         const uint64_t patch_tokens =
             static_cast<uint64_t>(condition.d) * (condition.h / 2) *
@@ -368,8 +478,9 @@ int SeedVR2Pipeline::restore(const ncnn::Mat& input_video,
             return ret;
         }
     }
-    ret = denoise(latent, condition, positive_text, negative_text, options);
-    if (staged)
+    if (!loaded_denoised)
+        ret = denoise(latent, condition, positive_text, negative_text, options);
+    if (staged && !loaded_denoised)
         dit.clear();
     if (ret != 0)
     {
@@ -381,6 +492,14 @@ int SeedVR2Pipeline::restore(const ncnn::Mat& input_video,
         std::fprintf(stderr, "SeedVR2 DiT denoise produced non-finite values\n");
         return -1;
     }
+    dump_if_requested("SEEDVR2_DUMP_DENOISED", latent);
+    trace_layout("denoised_before_vae", latent);
+    if (std::getenv("SEEDVR2_DENOISED_ONLY"))
+    {
+        output_video = latent;
+        return 0;
+    }
+
     if (staged)
     {
         ret = load_vae_stage();
@@ -392,6 +511,7 @@ int SeedVR2Pipeline::restore(const ncnn::Mat& input_video,
     }
     ncnn::Mat padded_output;
     ret = vae.decode(latent, padded_output);
+    trace_layout("decoded_padded", padded_output);
     if (staged)
         clear_vae_stage();
     if (ret != 0)
