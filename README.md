@@ -66,7 +66,7 @@ Load exported SeedVR2 DiT and VAE directories:
   --text-pos positive.f32 \
   --gpu 0 --steps 1 --cfg-scale 1
 ```
-
+Model in https://huggingface.co/Chisato623/seedvr2_ncnn
 For a video input, use the same command with a video path. The output format is
 selected by the input type: image inputs are written as PNG and video inputs
 are encoded by FFmpeg.
