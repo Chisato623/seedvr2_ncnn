@@ -6,7 +6,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(SEEDVR2_NCNN_COMMIT "946fe3fb14a8dff8c06df763f67be522167b2f00")
+# Official ncnn master, without SeedVR2-local ncnn patches.
+set(SEEDVR2_NCNN_COMMIT "3b7bdba7fc8aea8fd46779533eee027df77c639d")
 set(NCNN_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ncnn")
 
 if(NOT EXISTS "${NCNN_SOURCE_DIR}/CMakeLists.txt")
@@ -27,33 +28,6 @@ if(NOT NCNN_HEAD STREQUAL SEEDVR2_NCNN_COMMIT)
     message(FATAL_ERROR
         "Unsupported ncnn revision ${NCNN_HEAD}; expected ${SEEDVR2_NCNN_COMMIT}.")
 endif()
-
-function(apply_seedvr2_patch patch_path)
-    execute_process(
-        COMMAND git -C "${NCNN_SOURCE_DIR}" apply --check "${patch_path}"
-        RESULT_VARIABLE PATCH_RESULT)
-    if(PATCH_RESULT EQUAL 0)
-        execute_process(
-            COMMAND git -C "${NCNN_SOURCE_DIR}" apply "${patch_path}"
-            RESULT_VARIABLE APPLY_RESULT)
-        if(NOT APPLY_RESULT EQUAL 0)
-            message(FATAL_ERROR "Failed to apply ${patch_path}.")
-        endif()
-        return()
-    endif()
-
-    execute_process(
-        COMMAND git -C "${NCNN_SOURCE_DIR}" apply --reverse --check "${patch_path}"
-        RESULT_VARIABLE REVERSE_RESULT)
-    if(NOT REVERSE_RESULT EQUAL 0)
-        message(FATAL_ERROR "ncnn patch is neither applied nor applicable: ${patch_path}")
-    endif()
-endfunction()
-
-apply_seedvr2_patch(
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/ncnn/0001-nvidia-sdpa-softmax-sync.patch")
-apply_seedvr2_patch(
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/ncnn/0002-seedvr2-large-vulkan-workloads.patch")
 
 set(NCNN_VULKAN ON CACHE BOOL "" FORCE)
 set(NCNN_OPENMP OFF CACHE BOOL "" FORCE)
