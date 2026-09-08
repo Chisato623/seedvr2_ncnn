@@ -30,8 +30,12 @@ sudo apt install build-essential cmake pkg-config libvulkan-dev \
 Clone this repository with its ncnn submodule:
 
 ```bash
-git clone --recurse-submodules <repository-url> seedvr2-ncnn
+git clone --recurse-submodules https://github.com/Chisato623/seedvr2_ncnn.git seedvr2-ncnn
 cd seedvr2-ncnn
+
+git submodule update --init --recursive
+git submodule status
+
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
